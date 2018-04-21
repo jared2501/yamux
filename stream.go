@@ -11,7 +11,7 @@ import (
 type streamState int
 
 const (
-	streamInit streamState = iota
+	streamInit        streamState = iota
 	streamSYNSent
 	streamSYNReceived
 	streamEstablished
@@ -21,9 +21,15 @@ const (
 	streamReset
 )
 
+type StreamConfig struct {
+	Niceness uint8
+}
+
 // Stream is used to represent a logical stream
 // within a session.
 type Stream struct {
+	config *StreamConfig
+
 	recvWindow uint32
 	sendWindow uint32
 
@@ -53,8 +59,9 @@ type Stream struct {
 
 // newStream is used to construct a new stream within
 // a given session for an ID
-func newStream(session *Session, id uint32, state streamState) *Stream {
+func newStream(session *Session, id uint32, state streamState, config *StreamConfig) *Stream {
 	s := &Stream{
+		config:       config,
 		id:           id,
 		session:      session,
 		state:        state,
@@ -191,12 +198,12 @@ START:
 
 	// Send the header
 	s.sendHdr.encode(typeData, flags, s.id, max)
-	if err = s.session.waitForSendErr(s.sendHdr, body, s.sendErr); err != nil {
+	if err = s.session.waitForSendErr(s.config.Niceness, s.sendHdr, body, s.sendErr); err != nil {
 		return 0, err
 	}
 
 	// Reduce our send window
-	atomic.AddUint32(&s.sendWindow, ^uint32(max-1))
+	atomic.AddUint32(&s.sendWindow, ^uint32(max - 1))
 
 	// Unlock
 	return int(max), err
@@ -264,7 +271,7 @@ func (s *Stream) sendWindowUpdate() error {
 
 	// Send the header
 	s.controlHdr.encode(typeWindowUpdate, flags, s.id, delta)
-	if err := s.session.waitForSendErr(s.controlHdr, nil, s.controlErr); err != nil {
+	if err := s.session.waitForSendErr(0, s.controlHdr, nil, s.controlErr); err != nil {
 		return err
 	}
 	return nil
@@ -278,7 +285,7 @@ func (s *Stream) sendClose() error {
 	flags := s.sendFlags()
 	flags |= flagFIN
 	s.controlHdr.encode(typeWindowUpdate, flags, s.id, 0)
-	if err := s.session.waitForSendErr(s.controlHdr, nil, s.controlErr); err != nil {
+	if err := s.session.waitForSendErr(0, s.controlHdr, nil, s.controlErr); err != nil {
 		return err
 	}
 	return nil

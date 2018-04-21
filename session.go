@@ -14,6 +14,23 @@ import (
 	"time"
 )
 
+type sendChannel struct {
+	outgoing chan sendReady
+}
+
+func newSendChannel() *sendChannel {
+	return &sendChannel{outgoing: make(chan sendReady, 64)}
+}
+
+func (c *sendChannel) push(niceness uint8, send sendReady) chan struct{} {
+	accepted := make(chan struct{}, 1)
+	go func() {
+		c.outgoing <- send
+		accepted <- struct{}{}
+	}()
+	return accepted
+}
+
 // Session is used to wrap a reliable ordered connection and to
 // multiplex it into multiple streams.
 type Session struct {
@@ -63,7 +80,7 @@ type Session struct {
 
 	// sendCh is used to mark a stream as ready to send,
 	// or to send a header out directly.
-	sendCh chan sendReady
+	sendCh *sendChannel
 
 	// recvDoneCh is closed when recv() exits to avoid a race
 	// between stream registration and stream shutdown
@@ -96,7 +113,7 @@ func newSession(config *Config, conn io.ReadWriteCloser, client bool) *Session {
 		inflight:   make(map[uint32]struct{}),
 		synCh:      make(chan struct{}, config.AcceptBacklog),
 		acceptCh:   make(chan *Stream, config.AcceptBacklog),
-		sendCh:     make(chan sendReady, 64),
+		sendCh:     newSendChannel(),
 		recvDoneCh: make(chan struct{}),
 		shutdownCh: make(chan struct{}),
 	}
@@ -146,8 +163,12 @@ func (s *Session) Open() (net.Conn, error) {
 	return conn, nil
 }
 
-// OpenStream is used to create a new stream
 func (s *Session) OpenStream() (*Stream, error) {
+	return s.OpenStreamOpt(&StreamConfig{Niceness: 255})
+}
+
+// OpenStream is used to create a new stream
+func (s *Session) OpenStreamOpt(config *StreamConfig) (*Stream, error) {
 	if s.IsClosed() {
 		return nil, ErrSessionShutdown
 	}
@@ -163,7 +184,7 @@ func (s *Session) OpenStream() (*Stream, error) {
 	}
 
 GET_ID:
-	// Get an ID, and check for stream exhaustion
+// Get an ID, and check for stream exhaustion
 	id := atomic.LoadUint32(&s.nextStreamID)
 	if id >= math.MaxUint32-1 {
 		return nil, ErrStreamsExhausted
@@ -173,7 +194,7 @@ GET_ID:
 	}
 
 	// Register the stream
-	stream := newStream(s, id, streamInit)
+	stream := newStream(s, id, streamInit, config)
 	s.streamLock.Lock()
 	s.streams[id] = stream
 	s.inflight[id] = struct{}{}
@@ -201,11 +222,16 @@ func (s *Session) Accept() (net.Conn, error) {
 	return conn, err
 }
 
+func (s *Session) AcceptStream() (*Stream, error) {
+	return s.AcceptStreamOpt(&StreamConfig{Niceness: 255})
+}
+
 // AcceptStream is used to block until the next available stream
 // is ready to be accepted.
-func (s *Session) AcceptStream() (*Stream, error) {
+func (s *Session) AcceptStreamOpt(config *StreamConfig) (*Stream, error) {
 	select {
 	case stream := <-s.acceptCh:
+		stream.config = config
 		if err := stream.sendWindowUpdate(); err != nil {
 			return nil, err
 		}
@@ -254,7 +280,7 @@ func (s *Session) exitErr(err error) {
 // GoAway can be used to prevent accepting further
 // connections. It does not close the underlying conn.
 func (s *Session) GoAway() error {
-	return s.waitForSend(s.goAway(goAwayNormal), nil)
+	return s.waitForSend(0, s.goAway(goAwayNormal), nil)
 }
 
 // goAway is used to send a goAway message
@@ -280,7 +306,7 @@ func (s *Session) Ping() (time.Duration, error) {
 	// Send the ping request
 	hdr := header(make([]byte, headerSize))
 	hdr.encode(typePing, flagSYN, 0, id)
-	if err := s.waitForSend(hdr, nil); err != nil {
+	if err := s.waitForSend(0, hdr, nil); err != nil {
 		return 0, err
 	}
 
@@ -320,15 +346,15 @@ func (s *Session) keepalive() {
 }
 
 // waitForSendErr waits to send a header, checking for a potential shutdown
-func (s *Session) waitForSend(hdr header, body io.Reader) error {
+func (s *Session) waitForSend(niceness uint8, hdr header, body io.Reader) error {
 	errCh := make(chan error, 1)
-	return s.waitForSendErr(hdr, body, errCh)
+	return s.waitForSendErr(niceness, hdr, body, errCh)
 }
 
 // waitForSendErr waits to send a header with optional data, checking for a
 // potential shutdown. Since there's the expectation that sends can happen
 // in a timely manner, we enforce the connection write timeout here.
-func (s *Session) waitForSendErr(hdr header, body io.Reader, errCh chan error) error {
+func (s *Session) waitForSendErr(niceness uint8, hdr header, body io.Reader, errCh chan error) error {
 	t := timerPool.Get()
 	timer := t.(*time.Timer)
 	timer.Reset(s.config.ConnectionWriteTimeout)
@@ -341,9 +367,9 @@ func (s *Session) waitForSendErr(hdr header, body io.Reader, errCh chan error) e
 		timerPool.Put(t)
 	}()
 
-	ready := sendReady{Hdr: hdr, Body: body, Err: errCh}
+	sendAccepted := s.sendCh.push(niceness, sendReady{Hdr: hdr, Body: body, Err: errCh})
 	select {
-	case s.sendCh <- ready:
+	case <-sendAccepted:
 	case <-s.shutdownCh:
 		return ErrSessionShutdown
 	case <-timer.C:
@@ -363,7 +389,7 @@ func (s *Session) waitForSendErr(hdr header, body io.Reader, errCh chan error) e
 // sendNoWait does a send without waiting. Since there's the expectation that
 // the send happens right here, we enforce the connection write timeout if we
 // can't queue the header to be sent.
-func (s *Session) sendNoWait(hdr header) error {
+func (s *Session) sendNoWait(niceness uint8, hdr header) error {
 	t := timerPool.Get()
 	timer := t.(*time.Timer)
 	timer.Reset(s.config.ConnectionWriteTimeout)
@@ -376,8 +402,9 @@ func (s *Session) sendNoWait(hdr header) error {
 		timerPool.Put(t)
 	}()
 
+	sendAccepted := s.sendCh.push(niceness, sendReady{Hdr: hdr})
 	select {
-	case s.sendCh <- sendReady{Hdr: hdr}:
+	case <-sendAccepted:
 		return nil
 	case <-s.shutdownCh:
 		return ErrSessionShutdown
@@ -390,7 +417,7 @@ func (s *Session) sendNoWait(hdr header) error {
 func (s *Session) send() {
 	for {
 		select {
-		case ready := <-s.sendCh:
+		case ready := <-s.sendCh.outgoing:
 			// Send a header if ready
 			if ready.Hdr != nil {
 				sent := 0
@@ -506,7 +533,7 @@ func (s *Session) handleStreamMessage(hdr header) error {
 	// Check if this is a window update
 	if hdr.MsgType() == typeWindowUpdate {
 		if err := stream.incrSendWindow(hdr, flags); err != nil {
-			if sendErr := s.sendNoWait(s.goAway(goAwayProtoErr)); sendErr != nil {
+			if sendErr := s.sendNoWait(0, s.goAway(goAwayProtoErr)); sendErr != nil {
 				s.logger.Printf("[WARN] yamux: failed to send go away: %v", sendErr)
 			}
 			return err
@@ -516,7 +543,7 @@ func (s *Session) handleStreamMessage(hdr header) error {
 
 	// Read the new data
 	if err := stream.readData(hdr, flags, s.bufRead); err != nil {
-		if sendErr := s.sendNoWait(s.goAway(goAwayProtoErr)); sendErr != nil {
+		if sendErr := s.sendNoWait(0, s.goAway(goAwayProtoErr)); sendErr != nil {
 			s.logger.Printf("[WARN] yamux: failed to send go away: %v", sendErr)
 		}
 		return err
@@ -535,7 +562,7 @@ func (s *Session) handlePing(hdr header) error {
 		go func() {
 			hdr := header(make([]byte, headerSize))
 			hdr.encode(typePing, flagACK, 0, pingID)
-			if err := s.sendNoWait(hdr); err != nil {
+			if err := s.sendNoWait(0, hdr); err != nil {
 				s.logger.Printf("[WARN] yamux: failed to send ping reply: %v", err)
 			}
 		}()
@@ -578,11 +605,11 @@ func (s *Session) incomingStream(id uint32) error {
 	if atomic.LoadInt32(&s.localGoAway) == 1 {
 		hdr := header(make([]byte, headerSize))
 		hdr.encode(typeWindowUpdate, flagRST, id, 0)
-		return s.sendNoWait(hdr)
+		return s.sendNoWait(0, hdr)
 	}
 
 	// Allocate a new stream
-	stream := newStream(s, id, streamSYNReceived)
+	stream := newStream(s, id, streamSYNReceived, &StreamConfig{Niceness: 255})
 
 	s.streamLock.Lock()
 	defer s.streamLock.Unlock()
@@ -590,7 +617,7 @@ func (s *Session) incomingStream(id uint32) error {
 	// Check if stream already exists
 	if _, ok := s.streams[id]; ok {
 		s.logger.Printf("[ERR] yamux: duplicate stream declared")
-		if sendErr := s.sendNoWait(s.goAway(goAwayProtoErr)); sendErr != nil {
+		if sendErr := s.sendNoWait(0, s.goAway(goAwayProtoErr)); sendErr != nil {
 			s.logger.Printf("[WARN] yamux: failed to send go away: %v", sendErr)
 		}
 		return ErrDuplicateStream
@@ -608,7 +635,7 @@ func (s *Session) incomingStream(id uint32) error {
 		s.logger.Printf("[WARN] yamux: backlog exceeded, forcing connection reset")
 		delete(s.streams, id)
 		stream.sendHdr.encode(typeWindowUpdate, flagRST, id, 0)
-		return s.sendNoWait(stream.sendHdr)
+		return s.sendNoWait(0, stream.sendHdr)
 	}
 }
 

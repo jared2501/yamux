@@ -1123,7 +1123,7 @@ func TestSession_sendNoWait_Timeout(t *testing.T) {
 		hdr := header(make([]byte, headerSize))
 		hdr.encode(typePing, flagACK, 0, 0)
 		for {
-			err = client.sendNoWait(hdr)
+			err = client.sendNoWait(0, hdr)
 			if err == nil {
 				continue
 			} else if err == ErrConnectionWriteTimeout {
@@ -1166,7 +1166,7 @@ func TestSession_PingOfDeath(t *testing.T) {
 		for {
 			hdr := header(make([]byte, headerSize))
 			hdr.encode(typePing, 0, 0, 0)
-			err = server.sendNoWait(hdr)
+			err = server.sendNoWait(0, hdr)
 			if err == nil {
 				continue
 			} else if err == ErrConnectionWriteTimeout {
