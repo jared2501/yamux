@@ -32,6 +32,9 @@ type Config struct {
 
 	// LogOutput is used to control the log destination
 	LogOutput io.Writer
+
+	// MaxChunkSize is the maximum chunk of data to send at once
+	MaxChunkSize int
 }
 
 // DefaultConfig is used to return a default configuration
@@ -43,6 +46,7 @@ func DefaultConfig() *Config {
 		ConnectionWriteTimeout: 10 * time.Second,
 		MaxStreamWindowSize:    initialStreamWindow,
 		LogOutput:              os.Stderr,
+		MaxChunkSize:           10240,
 	}
 }
 

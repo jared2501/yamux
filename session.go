@@ -18,6 +18,7 @@ import (
 type entry struct {
 	niceness  uint8
 	sendReady *sendReady
+	pos       int
 }
 
 type sendChannel struct {
@@ -481,32 +482,29 @@ func (s *Session) send() {
 			s.sendCh.cond.Wait()
 		}
 		s.sendCh.cond.L.Unlock()
-		ready := next.sendReady
 
-		var chunk []byte
-		if ready.Body != nil {
-			if len(ready.Body) > 102400000000 {
-				chunk = ready.Body[:102400000000]
-				ready.Body = ready.Body[102400000000:]
+		var chunkLength int
+		if next.sendReady.Body != nil {
+			if len(next.sendReady.Body)-next.pos > s.config.MaxChunkSize {
+				chunkLength = s.config.MaxChunkSize
 			} else {
-				chunk = ready.Body[:]
-				ready.Body = nil
+				chunkLength = len(next.sendReady.Body) - next.pos
 			}
-			ready.Hdr.encode(
-				ready.Hdr.MsgType(),
-				ready.Hdr.Flags(),
-				ready.Hdr.StreamID(),
-				uint32(len(chunk)))
+			next.sendReady.Hdr.encode(
+				next.sendReady.Hdr.MsgType(),
+				next.sendReady.Hdr.Flags(),
+				next.sendReady.Hdr.StreamID(),
+				uint32(chunkLength))
 		}
 
-		// Send a header if ready
-		if ready.Hdr != nil {
+		// Send a header if next.sendReady
+		if next.sendReady.Hdr != nil {
 			sent := 0
-			for sent < len(ready.Hdr) {
-				n, err := s.conn.Write(ready.Hdr[sent:])
+			for sent < len(next.sendReady.Hdr) {
+				n, err := s.conn.Write(next.sendReady.Hdr[sent:])
 				if err != nil {
 					s.logger.Printf("[ERR] yamux: Failed to write header: %v", err)
-					asyncSendErr(ready.Err, err)
+					asyncSendErr(next.sendReady.Err, err)
 					s.exitErr(err)
 					return
 				}
@@ -515,18 +513,18 @@ func (s *Session) send() {
 		}
 
 		// Send data from a body if given
-		if chunk != nil {
-			_, err := io.Copy(s.conn, bytes.NewReader(chunk))
+		if chunkLength > 0 {
+			_, err := io.Copy(s.conn, bytes.NewReader(next.sendReady.Body[next.pos:next.pos+chunkLength]))
 			if err != nil {
 				s.logger.Printf("[ERR] yamux: Failed to write body: %v", err)
-				asyncSendErr(ready.Err, err)
+				asyncSendErr(next.sendReady.Err, err)
 				s.exitErr(err)
 				return
 			}
+			next.pos = next.pos + chunkLength
 		}
 
-		if ready.Body != nil {
-			fmt.Printf("continuing!\n")
+		if next.pos < len(next.sendReady.Body) {
 			continue
 		}
 
@@ -537,7 +535,7 @@ func (s *Session) send() {
 		s.sendCh.cond.L.Lock()
 		s.sendCh.remove(next)
 		s.sendCh.cond.L.Unlock()
-		asyncSendErr(ready.Err, nil)
+		asyncSendErr(next.sendReady.Err, nil)
 	}
 }
 
