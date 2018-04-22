@@ -454,6 +454,7 @@ func (s *Session) waitForSendErr(niceness uint8, hdr header, body []byte, errCh 
 	case <-s.shutdownCh:
 		return ErrSessionShutdown
 	case <-timer.C:
+		fmt.Printf("here no good at all\n")
 		return ErrConnectionWriteTimeout
 	}
 
@@ -463,6 +464,7 @@ func (s *Session) waitForSendErr(niceness uint8, hdr header, body []byte, errCh 
 	case <-s.shutdownCh:
 		return ErrSessionShutdown
 	case <-timer.C:
+		fmt.Printf("here ok\n")
 		return ErrConnectionWriteTimeout
 	}
 }
@@ -559,6 +561,7 @@ func (s *Session) send() {
 			}
 
 			// No error, successful send
+			fmt.Printf("Done!\n")
 			<-s.sendCh.semaphore
 			asyncSendErr(ready.Err, nil)
 		case <-s.shutdownCh:

@@ -64,8 +64,8 @@ func testConn() (io.ReadWriteCloser, io.ReadWriteCloser) {
 func testConf() *Config {
 	conf := DefaultConfig()
 	conf.AcceptBacklog = 64
-	conf.KeepAliveInterval = 200 * time.Millisecond
-	conf.ConnectionWriteTimeout = 10000 * time.Millisecond
+	conf.KeepAliveInterval = 100 * time.Millisecond
+	conf.ConnectionWriteTimeout = 250 * time.Millisecond
 	return conf
 }
 
