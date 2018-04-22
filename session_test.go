@@ -12,8 +12,6 @@ import (
 	"sync"
 	"testing"
 	"time"
-	"container/heap"
-	"github.com/stretchr/testify/assert"
 )
 
 type logCapture struct{ bytes.Buffer }
@@ -84,19 +82,6 @@ func testClientServerConfig(conf *Config) (*Session, *Session) {
 	client, _ := Client(conn1, conf)
 	server, _ := Server(conn2, conf)
 	return client, server
-}
-
-func TestOutgoingQueue(t *testing.T) {
-	outgoingQueue := &outgoingQueue{}
-	heap.Init(outgoingQueue)
-	entry1 := &entry{niceness: 1}
-	heap.Push(outgoingQueue, entry1)
-	outgoingQueue.Push(entry1)
-	entry3 := &entry{niceness: 3}
-	heap.Push(outgoingQueue, entry3)
-	entry2 := &entry{niceness: 2}
-	heap.Push(outgoingQueue, entry2)
-	assert.Equal(t, entry1, heap.Pop(outgoingQueue).(*entry))
 }
 
 func TestPing(t *testing.T) {
@@ -1373,7 +1358,6 @@ func TestSession_PrioritizedWrite_BothOpened(t *testing.T) {
 		}
 		fmt.Println("done!!")
 	}()
-
 
 	go func() {
 		defer wg.Done()

@@ -13,7 +13,6 @@ import (
 	"sync/atomic"
 	"time"
 	"bytes"
-	"container/heap"
 )
 
 type entry struct {
@@ -21,52 +20,18 @@ type entry struct {
 	sendReady *sendReady
 	accepted  chan struct{}
 }
-type outgoingQueue []*entry
-
-func (q outgoingQueue) Len() int {
-	return len(q)
-}
-
-func (q outgoingQueue) Less(i, j int) bool {
-	return (q)[i].niceness < (q)[j].niceness
-}
-
-func (q outgoingQueue) Swap(i, j int) {
-	q[i], q[j] = q[j], q[i]
-}
-
-// Push and Pop use pointer receivers because they modify the slice's length, not just its contents.
-func (q *outgoingQueue) Push(x interface{}) {
-	*q = append(*q, x.(*entry))
-}
-
-// Push and Pop use pointer receivers because they modify the slice's length, not just its contents.
-func (q *outgoingQueue) Pop() interface{} {
-	if len(*q) == 0 {
-		return nil
-	}
-	old := *q
-	n := len(old)
-	x := old[n-1]
-	*q = old[0 : n-1]
-	return x
-}
 
 type sendChannel struct {
-	tickle        chan struct{}
 	semaphore     chan struct{}
-	lock          sync.Mutex
-	outgoingQueue *outgoingQueue
+	cond          *sync.Cond
+	outgoingQueue []*entry
 	shutdown      bool
 }
 
 func newSendChannel() *sendChannel {
-	outgoingQueue := &outgoingQueue{}
-	heap.Init(outgoingQueue)
 	channel := &sendChannel{
-		tickle:        make(chan struct{}, 1),
-		semaphore:     make(chan struct{}, 64),
-		outgoingQueue: outgoingQueue,
+		semaphore: make(chan struct{}, 64),
+		cond:      sync.NewCond(&sync.Mutex{}),
 	}
 	return channel
 }
@@ -79,34 +44,47 @@ func (c *sendChannel) push(niceness uint8, send *sendReady) chan struct{} {
 	}
 	select {
 	case c.semaphore <- struct{}{}:
-		c.lock.Lock()
-		heap.Push(c.outgoingQueue, e)
-		select {
-		case c.tickle <- struct{}{}:
-		default:
-		}
-		c.lock.Unlock()
+		c.pushEntry(e)
 		e.accepted <- struct{}{}
 	default:
 		go func() {
 			c.semaphore <- struct{}{}
-			c.lock.Lock()
-			heap.Push(c.outgoingQueue, e)
-			select {
-			case c.tickle <- struct{}{}:
-			default:
-			}
-			c.lock.Unlock()
+			c.pushEntry(e)
 			e.accepted <- struct{}{}
 		}()
 	}
 	return e.accepted
 }
 
+func (c *sendChannel) pushEntry(entry *entry) {
+	c.cond.L.Lock()
+	c.outgoingQueue = append(c.outgoingQueue, entry)
+	c.cond.Broadcast()
+	c.cond.L.Unlock()
+}
+
+func (c *sendChannel) peek() *entry {
+	if len(c.outgoingQueue) == 0 {
+		return nil
+	}
+	return c.outgoingQueue[0]
+}
+
+func (c *sendChannel) remove(entry *entry) {
+	for i := 0; i < len(c.outgoingQueue); i++ {
+		if c.outgoingQueue[i] == entry {
+			c.outgoingQueue = append(c.outgoingQueue[:i], c.outgoingQueue[i+1:]...)
+			return
+		}
+	}
+	panic("Queue bug: element removed that never existed")
+}
+
 func (c *sendChannel) close() {
-	c.lock.Lock()
+	c.cond.L.Lock()
 	c.shutdown = true
-	c.lock.Unlock()
+	c.cond.Broadcast()
+	c.cond.L.Unlock()
 }
 
 // Session is used to wrap a reliable ordered connection and to
@@ -395,7 +373,6 @@ func (s *Session) Ping() (time.Duration, error) {
 	select {
 	case <-ch:
 	case <-time.After(s.config.ConnectionWriteTimeout):
-		fmt.Printf("stuff failed here...\n")
 		s.pingLock.Lock()
 		delete(s.pings, id) // Ignore it if a response comes later.
 		s.pingLock.Unlock()
@@ -454,7 +431,6 @@ func (s *Session) waitForSendErr(niceness uint8, hdr header, body []byte, errCh 
 	case <-s.shutdownCh:
 		return ErrSessionShutdown
 	case <-timer.C:
-		fmt.Printf("here no good at all\n")
 		return ErrConnectionWriteTimeout
 	}
 
@@ -464,7 +440,6 @@ func (s *Session) waitForSendErr(niceness uint8, hdr header, body []byte, errCh 
 	case <-s.shutdownCh:
 		return ErrSessionShutdown
 	case <-timer.C:
-		fmt.Printf("here ok\n")
 		return ErrConnectionWriteTimeout
 	}
 }
@@ -499,74 +474,77 @@ func (s *Session) sendNoWait(niceness uint8, hdr header) error {
 // send is a long running goroutine that sends data
 func (s *Session) send() {
 	for {
-		select {
-		case <-s.sendCh.tickle:
-			s.sendCh.lock.Lock()
-			next := heap.Pop(s.sendCh.outgoingQueue).(*entry)
-			ready := next.sendReady
-			s.sendCh.lock.Unlock()
-
-			var chunk []byte
-			if ready.Body != nil {
-				if len(ready.Body) > 102400000000 {
-					chunk = ready.Body[:102400000000]
-					ready.Body = ready.Body[102400000000:]
-				} else {
-					chunk = ready.Body[:]
-					ready.Body = nil
-				}
-				ready.Hdr.encode(
-					ready.Hdr.MsgType(),
-					ready.Hdr.Flags(),
-					ready.Hdr.StreamID(),
-					uint32(len(chunk)))
+		// TODO: peak instead of pop and push
+		var next *entry
+		s.sendCh.cond.L.Lock()
+		for true {
+			if s.sendCh.shutdown {
+				return
 			}
-
-			// Send a header if ready
-			if ready.Hdr != nil {
-				sent := 0
-				for sent < len(ready.Hdr) {
-					n, err := s.conn.Write(ready.Hdr[sent:])
-					if err != nil {
-						s.logger.Printf("[ERR] yamux: Failed to write header: %v", err)
-						asyncSendErr(ready.Err, err)
-						s.exitErr(err)
-						return
-					}
-					sent += n
-				}
+			next = s.sendCh.peek()
+			if next != nil {
+				break
 			}
+			s.sendCh.cond.Wait()
+		}
+		s.sendCh.cond.L.Unlock()
+		ready := next.sendReady
 
-			// Send data from a body if given
-			if chunk != nil {
-				_, err := io.Copy(s.conn, bytes.NewReader(chunk))
+		var chunk []byte
+		if ready.Body != nil {
+			if len(ready.Body) > 102400000000 {
+				chunk = ready.Body[:102400000000]
+				ready.Body = ready.Body[102400000000:]
+			} else {
+				chunk = ready.Body[:]
+				ready.Body = nil
+			}
+			ready.Hdr.encode(
+				ready.Hdr.MsgType(),
+				ready.Hdr.Flags(),
+				ready.Hdr.StreamID(),
+				uint32(len(chunk)))
+		}
+
+		// Send a header if ready
+		if ready.Hdr != nil {
+			sent := 0
+			for sent < len(ready.Hdr) {
+				n, err := s.conn.Write(ready.Hdr[sent:])
 				if err != nil {
-					s.logger.Printf("[ERR] yamux: Failed to write body: %v", err)
+					s.logger.Printf("[ERR] yamux: Failed to write header: %v", err)
 					asyncSendErr(ready.Err, err)
 					s.exitErr(err)
 					return
 				}
+				sent += n
 			}
-
-			if ready.Body != nil {
-				fmt.Printf("here???\n")
-				s.sendCh.lock.Lock()
-				heap.Push(s.sendCh.outgoingQueue, next)
-				s.sendCh.lock.Unlock()
-				select {
-				case s.sendCh.tickle <- struct{}{}:
-				default:
-				}
-				continue
-			}
-
-			// No error, successful send
-			fmt.Printf("Done!\n")
-			<-s.sendCh.semaphore
-			asyncSendErr(ready.Err, nil)
-		case <-s.shutdownCh:
-			return
 		}
+
+		// Send data from a body if given
+		if chunk != nil {
+			_, err := io.Copy(s.conn, bytes.NewReader(chunk))
+			if err != nil {
+				s.logger.Printf("[ERR] yamux: Failed to write body: %v", err)
+				asyncSendErr(ready.Err, err)
+				s.exitErr(err)
+				return
+			}
+		}
+
+		if ready.Body != nil {
+			fmt.Printf("continuing!\n")
+			continue
+		}
+
+		// No error, successful send
+		// TODO move all the sendCh crap into send channel
+
+		<-s.sendCh.semaphore
+		s.sendCh.cond.L.Lock()
+		s.sendCh.remove(next)
+		s.sendCh.cond.L.Unlock()
+		asyncSendErr(ready.Err, nil)
 	}
 }
 
