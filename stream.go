@@ -168,7 +168,6 @@ func (s *Stream) Write(b []byte) (n int, err error) {
 func (s *Stream) write(b []byte) (n int, err error) {
 	var flags uint16
 	var max uint32
-	var body io.Reader
 START:
 	s.stateLock.Lock()
 	switch s.state {
@@ -194,11 +193,10 @@ START:
 
 	// Send up to our send window
 	max = min(window, uint32(len(b)))
-	body = bytes.NewReader(b[:max])
 
 	// Send the header
 	s.sendHdr.encode(typeData, flags, s.id, max)
-	if err = s.session.waitForSendErr(s.config.Niceness, s.sendHdr, body, s.sendErr); err != nil {
+	if err = s.session.waitForSendErr(s.config.Niceness, s.sendHdr, b[:max], s.sendErr); err != nil {
 		return 0, err
 	}
 

@@ -12,6 +12,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"bytes"
 )
 
 type sendChannel struct {
@@ -97,7 +98,7 @@ type Session struct {
 // or to directly send a header
 type sendReady struct {
 	Hdr  []byte
-	Body io.Reader
+	Body []byte
 	Err  chan error
 }
 
@@ -346,7 +347,7 @@ func (s *Session) keepalive() {
 }
 
 // waitForSendErr waits to send a header, checking for a potential shutdown
-func (s *Session) waitForSend(niceness uint8, hdr header, body io.Reader) error {
+func (s *Session) waitForSend(niceness uint8, hdr header, body []byte) error {
 	errCh := make(chan error, 1)
 	return s.waitForSendErr(niceness, hdr, body, errCh)
 }
@@ -354,7 +355,7 @@ func (s *Session) waitForSend(niceness uint8, hdr header, body io.Reader) error 
 // waitForSendErr waits to send a header with optional data, checking for a
 // potential shutdown. Since there's the expectation that sends can happen
 // in a timely manner, we enforce the connection write timeout here.
-func (s *Session) waitForSendErr(niceness uint8, hdr header, body io.Reader, errCh chan error) error {
+func (s *Session) waitForSendErr(niceness uint8, hdr header, body []byte, errCh chan error) error {
 	t := timerPool.Get()
 	timer := t.(*time.Timer)
 	timer.Reset(s.config.ConnectionWriteTimeout)
@@ -435,7 +436,7 @@ func (s *Session) send() {
 
 			// Send data from a body if given
 			if ready.Body != nil {
-				_, err := io.Copy(s.conn, ready.Body)
+				_, err := io.Copy(s.conn, bytes.NewReader(ready.Body))
 				if err != nil {
 					s.logger.Printf("[ERR] yamux: Failed to write body: %v", err)
 					asyncSendErr(ready.Err, err)
