@@ -13,23 +13,100 @@ import (
 	"sync/atomic"
 	"time"
 	"bytes"
+	"container/heap"
 )
 
+type entry struct {
+	niceness  uint8
+	sendReady *sendReady
+	accepted  chan struct{}
+}
+type outgoingQueue []*entry
+
+func (q outgoingQueue) Len() int {
+	return len(q)
+}
+
+func (q outgoingQueue) Less(i, j int) bool {
+	return (q)[i].niceness < (q)[j].niceness
+}
+
+func (q outgoingQueue) Swap(i, j int) {
+	q[i], q[j] = q[j], q[i]
+}
+
+// Push and Pop use pointer receivers because they modify the slice's length, not just its contents.
+func (q *outgoingQueue) Push(x interface{}) {
+	*q = append(*q, x.(*entry))
+}
+
+// Push and Pop use pointer receivers because they modify the slice's length, not just its contents.
+func (q *outgoingQueue) Pop() interface{} {
+	if len(*q) == 0 {
+		return nil
+	}
+	old := *q
+	n := len(old)
+	x := old[n-1]
+	*q = old[0 : n-1]
+	return x
+}
+
 type sendChannel struct {
-	outgoing chan sendReady
+	tickle        chan struct{}
+	semaphore     chan struct{}
+	lock          sync.Mutex
+	outgoingQueue *outgoingQueue
+	shutdown      bool
 }
 
 func newSendChannel() *sendChannel {
-	return &sendChannel{outgoing: make(chan sendReady, 64)}
+	outgoingQueue := &outgoingQueue{}
+	heap.Init(outgoingQueue)
+	channel := &sendChannel{
+		tickle:        make(chan struct{}, 1),
+		semaphore:     make(chan struct{}, 64),
+		outgoingQueue: outgoingQueue,
+	}
+	return channel
 }
 
-func (c *sendChannel) push(niceness uint8, send sendReady) chan struct{} {
-	accepted := make(chan struct{}, 1)
-	go func() {
-		c.outgoing <- send
-		accepted <- struct{}{}
-	}()
-	return accepted
+func (c *sendChannel) push(niceness uint8, send *sendReady) chan struct{} {
+	e := &entry{
+		niceness:  niceness,
+		sendReady: send,
+		accepted:  make(chan struct{}, 1),
+	}
+	select {
+	case c.semaphore <- struct{}{}:
+		c.lock.Lock()
+		c.outgoingQueue.Push(e)
+		select {
+		case c.tickle <- struct{}{}:
+		default:
+		}
+		c.lock.Unlock()
+		e.accepted <- struct{}{}
+	default:
+		go func() {
+			c.semaphore <- struct{}{}
+			c.lock.Lock()
+			c.outgoingQueue.Push(e)
+			select {
+			case c.tickle <- struct{}{}:
+			default:
+			}
+			c.lock.Unlock()
+			e.accepted <- struct{}{}
+		}()
+	}
+	return e.accepted
+}
+
+func (c *sendChannel) close() {
+	c.lock.Lock()
+	c.shutdown = true
+	c.lock.Unlock()
 }
 
 // Session is used to wrap a reliable ordered connection and to
@@ -97,7 +174,7 @@ type Session struct {
 // sendReady is used to either mark a stream as ready
 // or to directly send a header
 type sendReady struct {
-	Hdr  []byte
+	Hdr  header
 	Body []byte
 	Err  chan error
 }
@@ -264,6 +341,8 @@ func (s *Session) Close() error {
 	for _, stream := range s.streams {
 		stream.forceClose()
 	}
+
+	s.sendCh.close()
 	return nil
 }
 
@@ -316,6 +395,7 @@ func (s *Session) Ping() (time.Duration, error) {
 	select {
 	case <-ch:
 	case <-time.After(s.config.ConnectionWriteTimeout):
+		fmt.Printf("stuff failed here...\n")
 		s.pingLock.Lock()
 		delete(s.pings, id) // Ignore it if a response comes later.
 		s.pingLock.Unlock()
@@ -368,7 +448,7 @@ func (s *Session) waitForSendErr(niceness uint8, hdr header, body []byte, errCh 
 		timerPool.Put(t)
 	}()
 
-	sendAccepted := s.sendCh.push(niceness, sendReady{Hdr: hdr, Body: body, Err: errCh})
+	sendAccepted := s.sendCh.push(niceness, &sendReady{Hdr: hdr, Body: body, Err: errCh})
 	select {
 	case <-sendAccepted:
 	case <-s.shutdownCh:
@@ -403,7 +483,7 @@ func (s *Session) sendNoWait(niceness uint8, hdr header) error {
 		timerPool.Put(t)
 	}()
 
-	sendAccepted := s.sendCh.push(niceness, sendReady{Hdr: hdr})
+	sendAccepted := s.sendCh.push(niceness, &sendReady{Hdr: hdr})
 	select {
 	case <-sendAccepted:
 		return nil
@@ -418,7 +498,28 @@ func (s *Session) sendNoWait(niceness uint8, hdr header) error {
 func (s *Session) send() {
 	for {
 		select {
-		case ready := <-s.sendCh.outgoing:
+		case <-s.sendCh.tickle:
+			s.sendCh.lock.Lock()
+			next := s.sendCh.outgoingQueue.Pop().(*entry)
+			ready := next.sendReady
+			s.sendCh.lock.Unlock()
+
+			var chunk []byte
+			if ready.Body != nil {
+				if len(ready.Body) > 1024 {
+					chunk = ready.Body[:1024]
+					ready.Body = ready.Body[1024:]
+				} else {
+					chunk = ready.Body[:]
+					ready.Body = nil
+				}
+				ready.Hdr.encode(
+					ready.Hdr.MsgType(),
+					ready.Hdr.Flags(),
+					ready.Hdr.StreamID(),
+					uint32(len(chunk)))
+			}
+
 			// Send a header if ready
 			if ready.Hdr != nil {
 				sent := 0
@@ -435,8 +536,8 @@ func (s *Session) send() {
 			}
 
 			// Send data from a body if given
-			if ready.Body != nil {
-				_, err := io.Copy(s.conn, bytes.NewReader(ready.Body))
+			if chunk != nil {
+				_, err := io.Copy(s.conn, bytes.NewReader(chunk))
 				if err != nil {
 					s.logger.Printf("[ERR] yamux: Failed to write body: %v", err)
 					asyncSendErr(ready.Err, err)
@@ -445,7 +546,19 @@ func (s *Session) send() {
 				}
 			}
 
+			if ready.Body != nil {
+				s.sendCh.lock.Lock()
+				s.sendCh.outgoingQueue.Push(next)
+				s.sendCh.lock.Unlock()
+				select {
+				case s.sendCh.tickle <- struct{}{}:
+				default:
+				}
+				continue
+			}
+
 			// No error, successful send
+			<-s.sendCh.semaphore
 			asyncSendErr(ready.Err, nil)
 		case <-s.shutdownCh:
 			return
@@ -552,7 +665,7 @@ func (s *Session) handleStreamMessage(hdr header) error {
 	return nil
 }
 
-// handlePing is invokde for a typePing frame
+// handlePing is invoked for a typePing frame
 func (s *Session) handlePing(hdr header) error {
 	flags := hdr.Flags()
 	pingID := hdr.Length()
@@ -581,7 +694,7 @@ func (s *Session) handlePing(hdr header) error {
 	return nil
 }
 
-// handleGoAway is invokde for a typeGoAway frame
+// handleGoAway is invoked for a typeGoAway frame
 func (s *Session) handleGoAway(hdr header) error {
 	code := hdr.Length()
 	switch code {

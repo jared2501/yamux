@@ -62,8 +62,8 @@ func testConn() (io.ReadWriteCloser, io.ReadWriteCloser) {
 func testConf() *Config {
 	conf := DefaultConfig()
 	conf.AcceptBacklog = 64
-	conf.KeepAliveInterval = 100 * time.Millisecond
-	conf.ConnectionWriteTimeout = 250 * time.Millisecond
+	conf.KeepAliveInterval = 200 * time.Millisecond
+	conf.ConnectionWriteTimeout = 5000 * time.Millisecond
 	return conf
 }
 
@@ -395,21 +395,18 @@ func TestSendData_Large(t *testing.T) {
 		if err != nil {
 			t.Fatalf("err: %v", err)
 		}
-		var sz int
+		var ptr int
 		buf := make([]byte, recvSize)
-		for i := 0; i < sendSize/recvSize; i++ {
+		for ptr < sendSize {
 			n, err := stream.Read(buf)
 			if err != nil {
 				t.Fatalf("err: %v", err)
 			}
-			if n != recvSize {
-				t.Fatalf("short read: %d", n)
-			}
-			sz += n
-			for idx := range buf {
-				if buf[idx] != byte(idx%256) {
-					t.Fatalf("bad: %v %v %v", i, idx, buf[idx])
+			for i := 0; i < n; i++ {
+				if buf[i] != byte(ptr%256) {
+					t.Fatalf("bad: %v %v %v", i, ptr, buf[ptr])
 				}
+				ptr += 1
 			}
 		}
 
@@ -417,7 +414,7 @@ func TestSendData_Large(t *testing.T) {
 			t.Fatalf("err: %v", err)
 		}
 
-		t.Logf("cap=%d, n=%d\n", stream.recvBuf.Cap(), sz)
+		t.Logf("cap=%d, n=%d\n", stream.recvBuf.Cap(), ptr)
 	}()
 
 	go func() {
@@ -1253,4 +1250,144 @@ func TestSession_ConnectionWriteTimeout(t *testing.T) {
 	}()
 
 	wg.Wait()
+}
+
+func TestSession_PrioritizedWrite_AcceptedAndOpened(t *testing.T) {
+	t.FailNow()
+}
+
+func TestSession_PrioritizedWrite_BothAccepted(t *testing.T) {
+	t.FailNow()
+}
+
+func TestSession_PrioritizedWrite_BothOpened(t *testing.T) {
+	client, server := testClientServer()
+	defer client.Close()
+	defer server.Close()
+
+	const (
+		sendSize = 100 * 1024 * 1024
+		recvSize = 4 * 1024
+	)
+
+	data := make([]byte, sendSize)
+	for idx := range data {
+		data[idx] = byte(idx % 256)
+	}
+
+	wg := &sync.WaitGroup{}
+	wg.Add(2)
+
+	go func() {
+		defer wg.Done()
+		stream, err := server.AcceptStream()
+		if err != nil {
+			t.Fatalf("err: %v", err)
+		}
+		var sz int
+		buf := make([]byte, recvSize)
+		for i := 0; i < sendSize/recvSize; i++ {
+			n, err := stream.Read(buf)
+			if err != nil {
+				t.Fatalf("err: %v", err)
+			}
+			if n != recvSize {
+				t.Fatalf("short read: %d", n)
+			}
+			sz += n
+			for idx := range buf {
+				if buf[idx] != byte(idx%256) {
+					t.Fatalf("bad: %v %v %v", i, idx, buf[idx])
+				}
+			}
+		}
+
+		if err := stream.Close(); err != nil {
+			t.Fatalf("err: %v", err)
+		}
+
+		t.Logf("cap=%d, n=%d\n", stream.recvBuf.Cap(), sz)
+	}()
+	go func() {
+		defer wg.Done()
+		stream, err := server.AcceptStream()
+		if err != nil {
+			t.Fatalf("err: %v", err)
+		}
+		var sz int
+		buf := make([]byte, recvSize)
+		for i := 0; i < sendSize/recvSize; i++ {
+			n, err := stream.Read(buf)
+			if err != nil {
+				t.Fatalf("err: %v", err)
+			}
+			if n != recvSize {
+				t.Fatalf("short read: %d", n)
+			}
+			sz += n
+			for idx := range buf {
+				if buf[idx] != byte(idx%256) {
+					t.Fatalf("bad: %v %v %v", i, idx, buf[idx])
+				}
+			}
+		}
+
+		if err := stream.Close(); err != nil {
+			t.Fatalf("err: %v", err)
+		}
+
+		t.Logf("cap=%d, n=%d\n", stream.recvBuf.Cap(), sz)
+	}()
+
+	go func() {
+		defer wg.Done()
+		stream, err := client.OpenStreamOpt(&StreamConfig{Niceness: 100})
+		if err != nil {
+			t.Fatalf("err: %v", err)
+		}
+
+		n, err := stream.Write(data[:])
+		if err != nil {
+			t.Fatalf("err: %v", err)
+		}
+		if n != len(data) {
+			t.Fatalf("short write %d", n)
+		}
+		if err := stream.Close(); err != nil {
+			t.Fatalf("err: %v", err)
+		}
+		fmt.Println("done!!")
+	}()
+
+
+	go func() {
+		defer wg.Done()
+		stream, err := client.OpenStreamOpt(&StreamConfig{Niceness: 200})
+		if err != nil {
+			t.Fatalf("err: %v", err)
+		}
+
+		n, err := stream.Write(data[:])
+		if err != nil {
+			t.Fatalf("err: %v", err)
+		}
+		if n != len(data) {
+			t.Fatalf("short write %d", n)
+		}
+		if err := stream.Close(); err != nil {
+			t.Fatalf("err: %v", err)
+		}
+		fmt.Println("done!! 2")
+	}()
+
+	doneCh := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(doneCh)
+	}()
+	select {
+	case <-doneCh:
+	case <-time.After(5 * time.Second):
+		panic("timeout")
+	}
 }
