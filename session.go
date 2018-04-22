@@ -35,11 +35,19 @@ func newSendChannel() *sendChannel {
 	return channel
 }
 
-func (c *sendChannel) pushEntry(entry *entry) {
+func (c *sendChannel) pushEntry(e *entry) {
 	c.cond.L.Lock()
-	c.outgoingQueue = append(c.outgoingQueue, entry)
-	c.cond.Broadcast()
-	c.cond.L.Unlock()
+	defer func() {
+		c.cond.Broadcast()
+		c.cond.L.Unlock()
+	}()
+	for i := 0; i < len(c.outgoingQueue); i++ {
+		if c.outgoingQueue[i].niceness > e.niceness {
+			c.outgoingQueue = append(c.outgoingQueue[:i], append([]*entry{e}, c.outgoingQueue[i:]...)...)
+			return
+		}
+	}
+	c.outgoingQueue = append(c.outgoingQueue, e)
 }
 
 func (c *sendChannel) peek() *entry {
