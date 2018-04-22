@@ -18,7 +18,6 @@ import (
 type entry struct {
 	niceness  uint8
 	sendReady *sendReady
-	accepted  chan struct{}
 }
 
 type sendChannel struct {
@@ -34,26 +33,6 @@ func newSendChannel() *sendChannel {
 		cond:      sync.NewCond(&sync.Mutex{}),
 	}
 	return channel
-}
-
-func (c *sendChannel) push(niceness uint8, send *sendReady) chan struct{} {
-	e := &entry{
-		niceness:  niceness,
-		sendReady: send,
-		accepted:  make(chan struct{}, 1),
-	}
-	select {
-	case c.semaphore <- struct{}{}:
-		c.pushEntry(e)
-		e.accepted <- struct{}{}
-	default:
-		go func() {
-			c.semaphore <- struct{}{}
-			c.pushEntry(e)
-			e.accepted <- struct{}{}
-		}()
-	}
-	return e.accepted
 }
 
 func (c *sendChannel) pushEntry(entry *entry) {
@@ -425,9 +404,12 @@ func (s *Session) waitForSendErr(niceness uint8, hdr header, body []byte, errCh 
 		timerPool.Put(t)
 	}()
 
-	sendAccepted := s.sendCh.push(niceness, &sendReady{Hdr: hdr, Body: body, Err: errCh})
 	select {
-	case <-sendAccepted:
+	case s.sendCh.semaphore <- struct{}{}:
+		s.sendCh.pushEntry(&entry{
+			niceness:  niceness,
+			sendReady: &sendReady{Hdr: hdr, Body: body, Err: errCh},
+		})
 	case <-s.shutdownCh:
 		return ErrSessionShutdown
 	case <-timer.C:
@@ -460,9 +442,12 @@ func (s *Session) sendNoWait(niceness uint8, hdr header) error {
 		timerPool.Put(t)
 	}()
 
-	sendAccepted := s.sendCh.push(niceness, &sendReady{Hdr: hdr})
 	select {
-	case <-sendAccepted:
+	case s.sendCh.semaphore <- struct{}{}:
+		s.sendCh.pushEntry(&entry{
+			niceness:  niceness,
+			sendReady: &sendReady{Hdr: hdr},
+		})
 		return nil
 	case <-s.shutdownCh:
 		return ErrSessionShutdown

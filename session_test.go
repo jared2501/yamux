@@ -458,6 +458,8 @@ func TestGoAway(t *testing.T) {
 		t.Fatalf("err: %v", err)
 	}
 
+	time.Sleep(10 * time.Millisecond)
+
 	_, err := client.Open()
 	if err != ErrRemoteGoAway {
 		t.Fatalf("err: %v", err)
