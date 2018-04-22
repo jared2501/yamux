@@ -12,6 +12,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+	"container/heap"
+	"github.com/stretchr/testify/assert"
 )
 
 type logCapture struct{ bytes.Buffer }
@@ -63,7 +65,7 @@ func testConf() *Config {
 	conf := DefaultConfig()
 	conf.AcceptBacklog = 64
 	conf.KeepAliveInterval = 200 * time.Millisecond
-	conf.ConnectionWriteTimeout = 5000 * time.Millisecond
+	conf.ConnectionWriteTimeout = 10000 * time.Millisecond
 	return conf
 }
 
@@ -82,6 +84,19 @@ func testClientServerConfig(conf *Config) (*Session, *Session) {
 	client, _ := Client(conn1, conf)
 	server, _ := Server(conn2, conf)
 	return client, server
+}
+
+func TestOutgoingQueue(t *testing.T) {
+	outgoingQueue := &outgoingQueue{}
+	heap.Init(outgoingQueue)
+	entry1 := &entry{niceness: 1}
+	heap.Push(outgoingQueue, entry1)
+	outgoingQueue.Push(entry1)
+	entry3 := &entry{niceness: 3}
+	heap.Push(outgoingQueue, entry3)
+	entry2 := &entry{niceness: 2}
+	heap.Push(outgoingQueue, entry2)
+	assert.Equal(t, entry1, heap.Pop(outgoingQueue).(*entry))
 }
 
 func TestPing(t *testing.T) {
@@ -878,7 +893,7 @@ func TestSendData_VeryLarge(t *testing.T) {
 	defer server.Close()
 
 	var n int64 = 1 * 1024 * 1024 * 1024
-	var workers int = 16
+	var workers = 16
 
 	wg := &sync.WaitGroup{}
 	wg.Add(workers * 2)

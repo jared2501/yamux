@@ -80,7 +80,7 @@ func (c *sendChannel) push(niceness uint8, send *sendReady) chan struct{} {
 	select {
 	case c.semaphore <- struct{}{}:
 		c.lock.Lock()
-		c.outgoingQueue.Push(e)
+		heap.Push(c.outgoingQueue, e)
 		select {
 		case c.tickle <- struct{}{}:
 		default:
@@ -91,7 +91,7 @@ func (c *sendChannel) push(niceness uint8, send *sendReady) chan struct{} {
 		go func() {
 			c.semaphore <- struct{}{}
 			c.lock.Lock()
-			c.outgoingQueue.Push(e)
+			heap.Push(c.outgoingQueue, e)
 			select {
 			case c.tickle <- struct{}{}:
 			default:
@@ -500,15 +500,15 @@ func (s *Session) send() {
 		select {
 		case <-s.sendCh.tickle:
 			s.sendCh.lock.Lock()
-			next := s.sendCh.outgoingQueue.Pop().(*entry)
+			next := heap.Pop(s.sendCh.outgoingQueue).(*entry)
 			ready := next.sendReady
 			s.sendCh.lock.Unlock()
 
 			var chunk []byte
 			if ready.Body != nil {
-				if len(ready.Body) > 1024 {
-					chunk = ready.Body[:1024]
-					ready.Body = ready.Body[1024:]
+				if len(ready.Body) > 102400000000 {
+					chunk = ready.Body[:102400000000]
+					ready.Body = ready.Body[102400000000:]
 				} else {
 					chunk = ready.Body[:]
 					ready.Body = nil
@@ -547,8 +547,9 @@ func (s *Session) send() {
 			}
 
 			if ready.Body != nil {
+				fmt.Printf("here???\n")
 				s.sendCh.lock.Lock()
-				s.sendCh.outgoingQueue.Push(next)
+				heap.Push(s.sendCh.outgoingQueue, next)
 				s.sendCh.lock.Unlock()
 				select {
 				case s.sendCh.tickle <- struct{}{}:
