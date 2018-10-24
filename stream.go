@@ -185,8 +185,8 @@ START:
 	// Determine the flags if any
 	flags = s.sendFlags()
 
-	// Send up to our send window
-	max = min(window, uint32(len(b)))
+	// Send up to our send window, obeying the maximum frame size
+	max = min(s.session.config.MaxFrameSize, min(window, uint32(len(b))))
 	body = bytes.NewReader(b[:max])
 
 	// Send the header
@@ -196,7 +196,7 @@ START:
 	}
 
 	// Reduce our send window
-	atomic.AddUint32(&s.sendWindow, ^uint32(max-1))
+	atomic.AddUint32(&s.sendWindow, ^uint32(max - 1))
 
 	// Unlock
 	return int(max), err

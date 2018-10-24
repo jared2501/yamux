@@ -31,6 +31,10 @@ type Config struct {
 	// window size that we allow for a stream.
 	MaxStreamWindowSize uint32
 
+	// MaxFrameSize is used to control the maximum size of a frame that a
+	// stream may write to the connection.
+	MaxFrameSize uint32
+
 	// LogOutput is used to control the log destination. Either Logger or
 	// LogOutput can be set, not both.
 	LogOutput io.Writer
@@ -48,6 +52,7 @@ func DefaultConfig() *Config {
 		KeepAliveInterval:      30 * time.Second,
 		ConnectionWriteTimeout: 10 * time.Second,
 		MaxStreamWindowSize:    initialStreamWindow,
+		MaxFrameSize:           64 * 1024,
 		LogOutput:              os.Stderr,
 	}
 }
